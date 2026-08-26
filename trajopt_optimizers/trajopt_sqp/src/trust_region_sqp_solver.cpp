@@ -36,6 +36,82 @@
 #include <chrono>
 #include <cassert>
 
+// [fable qplog 2026-07-13] extra includes for the gated GP25 QP#1 dump below (header-only, no ABI impact)
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#include <unistd.h>
+
+// [fable qplog 2026-07-13] GP25 debug helpers (branch fable-constraint-spike, step A2).
+// File-local (internal linkage), used only inside function bodies — ABI-safe. Gate = presence of
+// ~/.config/gp25_trajopt_debug.on, evaluated exactly once per process; zero behavior change when off.
+namespace
+{
+// FNV-1a over raw bytes, chainable via the h argument.
+std::uint64_t gp25Fnv1a(const void* data, std::size_t nbytes, std::uint64_t h = 0xcbf29ce484222325ULL)
+{
+  const auto* p = static_cast<const unsigned char*>(data);
+  for (std::size_t i = 0; i < nbytes; ++i)
+  {
+    h ^= static_cast<std::uint64_t>(p[i]);
+    h *= 0x100000001b3ULL;
+  }
+  return h;
+}
+
+bool gp25QpDebugEnabled()
+{
+  static const bool enabled = [] {
+    const char* home = std::getenv("HOME");
+    return std::ifstream(std::string(home != nullptr ? home : "") + "/.config/gp25_trajopt_debug.on").good();
+  }();
+  return enabled;
+}
+
+// Hash an Eigen row-major sparse matrix (trajopt_ifopt::Jacobian).
+// Compressed (the normal case after setFromTriplets/makeCompressed): raw bytes of the three CSR
+// arrays — valuePtr() double[nnz], innerIndexPtr() StorageIndex[nnz], outerIndexPtr()
+// StorageIndex[outerSize+1] — reported separately as val/inner/outer.
+// Uncompressed fallback: single chained hash over (row int64, col int64, value double bytes) per
+// nonzero in InnerIterator order, reported as val (inner/outer = 0). fmt says which path ran.
+void gp25HashSparse(const Eigen::SparseMatrix<double, Eigen::RowMajor>& m,
+                    const char*& fmt,
+                    std::uint64_t& h_val,
+                    std::uint64_t& h_inner,
+                    std::uint64_t& h_outer)
+{
+  using SpMat = Eigen::SparseMatrix<double, Eigen::RowMajor>;
+  if (m.isCompressed())
+  {
+    fmt = "csr-arrays";
+    h_val = gp25Fnv1a(m.valuePtr(), sizeof(double) * static_cast<std::size_t>(m.nonZeros()));
+    h_inner = gp25Fnv1a(m.innerIndexPtr(), sizeof(SpMat::StorageIndex) * static_cast<std::size_t>(m.nonZeros()));
+    h_outer = gp25Fnv1a(m.outerIndexPtr(), sizeof(SpMat::StorageIndex) * static_cast<std::size_t>(m.outerSize() + 1));
+  }
+  else
+  {
+    fmt = "triplet-iter";
+    std::uint64_t h = 0xcbf29ce484222325ULL;
+    for (Eigen::Index k = 0; k < m.outerSize(); ++k)
+    {
+      for (SpMat::InnerIterator it(m, k); it; ++it)
+      {
+        const std::int64_t rc[2] = { static_cast<std::int64_t>(it.row()), static_cast<std::int64_t>(it.col()) };
+        const double v = it.value();
+        h = gp25Fnv1a(rc, sizeof(rc), h);
+        h = gp25Fnv1a(&v, sizeof(v), h);
+      }
+    }
+    h_val = h;
+    h_inner = 0;
+    h_outer = 0;
+  }
+}
+}  // namespace
+
 namespace trajopt_sqp
 {
 const bool SUPER_DEBUG_MODE = false;
@@ -240,6 +316,76 @@ bool TrustRegionSQPSolver::stepSQPSolver()
       qp_solver->updateLinearConstraintsMatrix(qp_problem->getConstraintMatrix());
       qp_solver->updateBounds(qp_problem->getBoundsLower(), qp_problem->getBoundsUpper());
       qp_solver->setWarmStart(*qp_problem);
+    }
+  }
+
+  // [fable qplog 2026-07-13] GP25 debug: dump digests of the convexified QP exactly as handed to the
+  // QP solver, for the first 3 convexify sweeps of the process. Gated + read-only — no behavior change.
+  if (gp25QpDebugEnabled())
+  {
+    static std::atomic<int> s_convexify_counter{ 0 };
+    const int idx = s_convexify_counter.fetch_add(1);
+    if (idx < 3)
+    {
+      const std::string path = "/tmp/fable_qplog_" + std::to_string(getpid()) + ".txt";
+      if (std::FILE* f = std::fopen(path.c_str(), "a"))
+      {
+        const trajopt_ifopt::Jacobian& P = qp_problem->getHessian();
+        const Eigen::VectorXd& q = qp_problem->getGradient();
+        const trajopt_ifopt::Jacobian& A = qp_problem->getConstraintMatrix();
+        const Eigen::VectorXd& l = qp_problem->getBoundsLower();
+        const Eigen::VectorXd& u = qp_problem->getBoundsUpper();
+        const Eigen::VectorXd& box = qp_problem->getBoxSize();
+
+        const char* p_fmt = nullptr;
+        std::uint64_t p_val = 0, p_inner = 0, p_outer = 0;
+        gp25HashSparse(P, p_fmt, p_val, p_inner, p_outer);
+        const char* a_fmt = nullptr;
+        std::uint64_t a_val = 0, a_inner = 0, a_outer = 0;
+        gp25HashSparse(A, a_fmt, a_val, a_inner, a_outer);
+
+        std::fprintf(f,
+                     "CONVEXIFY#%d dims nv=%lld nc=%lld P_nnz=%lld A_nnz=%lld first_time=%d dims_changed=%d "
+                     "penalty_iter=%d convex_iter=%d overall_iter=%d\n",
+                     idx,
+                     static_cast<long long>(nv),
+                     static_cast<long long>(nc),
+                     static_cast<long long>(P.nonZeros()),
+                     static_cast<long long>(A.nonZeros()),
+                     first_time ? 1 : 0,
+                     dims_changed ? 1 : 0,
+                     results_.penalty_iteration,
+                     results_.convexify_iteration,
+                     results_.overall_iteration);
+        std::fprintf(f, "CONVEXIFY#%d P fmt=%s val=%016llx inner=%016llx outer=%016llx\n",
+                     idx, p_fmt,
+                     static_cast<unsigned long long>(p_val),
+                     static_cast<unsigned long long>(p_inner),
+                     static_cast<unsigned long long>(p_outer));
+        std::fprintf(f, "CONVEXIFY#%d q hash=%016llx n=%lld\n", idx,
+                     static_cast<unsigned long long>(
+                         gp25Fnv1a(q.data(), sizeof(double) * static_cast<std::size_t>(q.size()))),
+                     static_cast<long long>(q.size()));
+        std::fprintf(f, "CONVEXIFY#%d A fmt=%s val=%016llx inner=%016llx outer=%016llx\n",
+                     idx, a_fmt,
+                     static_cast<unsigned long long>(a_val),
+                     static_cast<unsigned long long>(a_inner),
+                     static_cast<unsigned long long>(a_outer));
+        std::fprintf(f, "CONVEXIFY#%d l hash=%016llx m=%lld\n", idx,
+                     static_cast<unsigned long long>(
+                         gp25Fnv1a(l.data(), sizeof(double) * static_cast<std::size_t>(l.size()))),
+                     static_cast<long long>(l.size()));
+        std::fprintf(f, "CONVEXIFY#%d u hash=%016llx m=%lld\n", idx,
+                     static_cast<unsigned long long>(
+                         gp25Fnv1a(u.data(), sizeof(double) * static_cast<std::size_t>(u.size()))),
+                     static_cast<long long>(u.size()));
+        std::fprintf(f, "CONVEXIFY#%d box hash=%016llx box[0]=%.17g merit_coeff[0]=%.17g\n", idx,
+                     static_cast<unsigned long long>(
+                         gp25Fnv1a(box.data(), sizeof(double) * static_cast<std::size_t>(box.size()))),
+                     box.size() > 0 ? box[0] : -1.0,
+                     results_.merit_error_coeffs.size() > 0 ? results_.merit_error_coeffs[0] : -1.0);
+        std::fclose(f);
+      }
     }
   }
 

@@ -39,6 +39,15 @@ TRAJOPT_IGNORE_WARNINGS_POP
 
 #include <trajopt_ifopt/utils/numeric_differentiation.h>
 
+// [fable rowlog 2026-07-13] GP25 constraint-row debug hook — runtime flag-gated, function-body only
+// (no header/class changes, ABI-safe). See DiscreteCollisionConstraintD::update().
+#include <fstream>
+#include <atomic>
+#include <sstream>
+#include <iomanip>
+#include <cstdlib>
+#include <unistd.h>
+
 namespace trajopt_ifopt
 {
 DiscreteCollisionConstraint::DiscreteCollisionConstraint(
@@ -213,6 +222,40 @@ int DiscreteCollisionConstraintD::update()
   }
 
   assert(rows_ == i);
+
+  // [fable rowlog 2026-07-13] GP25 debug hook: dump constraint rows (content AND order) per
+  // update-event. Gate is a process-wide static evaluated exactly once; when the flag file is
+  // absent this whole block is a single branch on a cached bool — zero behavior change.
+  {
+    static const bool s_rowlog_on = [] {
+      const char* home = std::getenv("HOME");
+      return std::ifstream(std::string(home != nullptr ? home : "") + "/.config/gp25_trajopt_debug.on").good();
+    }();
+    if (s_rowlog_on)
+    {
+      static std::atomic<int> s_rowlog_counter{ 0 };
+      static std::ofstream s_rowlog("/tmp/fable_rowlog_" + std::to_string(getpid()) + ".txt", std::ios::app);
+      const int event = s_rowlog_counter.fetch_add(1);
+      if (event < 400)
+      {
+        // Build the event in one string so concurrent updates cannot interleave lines.
+        std::ostringstream ss;
+        ss << "U " << event << " obj=" << static_cast<const void*>(this) << " n=" << rows_ << "\n";
+        ss << std::fixed << std::setprecision(6);
+        // Same container, same traversal as the row-building loop above => identical row order.
+        for (const auto& pair : collision_data_->contact_results_map)
+          for (const auto& contact_results : pair.second)
+            ss << "  " << pair.first.first << "|" << pair.first.second << " d=" << contact_results.distance << "\n";
+        s_rowlog << ss.str();
+        s_rowlog.flush();
+      }
+      else if (event == 400)
+      {
+        s_rowlog << "TRUNCATED\n";
+        s_rowlog.flush();
+      }
+    }
+  }
 
   return rows_;
 }
