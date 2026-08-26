@@ -29,9 +29,42 @@ TRAJOPT_IGNORE_WARNINGS_PUSH
 #include <OsqpEigen/OsqpEigen.h>
 TRAJOPT_IGNORE_WARNINGS_POP
 
+// [fable qplog 2026-07-13] extra includes for the gated GP25 QP#1 dump below (header-only, no ABI impact)
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#include <unistd.h>
+
 namespace
 {
 constexpr bool OSQP_COMPARE_DEBUG_MODE = false;
+
+// [fable qplog 2026-07-13] GP25 debug helpers (branch fable-constraint-spike, step A2).
+// File-local (internal linkage), used only inside function bodies — ABI-safe. Gate = presence of
+// ~/.config/gp25_trajopt_debug.on, evaluated exactly once per process; zero behavior change when off.
+// FNV-1a over raw bytes, chainable via the h argument.
+std::uint64_t gp25Fnv1a(const void* data, std::size_t nbytes, std::uint64_t h = 0xcbf29ce484222325ULL)
+{
+  const auto* p = static_cast<const unsigned char*>(data);
+  for (std::size_t i = 0; i < nbytes; ++i)
+  {
+    h ^= static_cast<std::uint64_t>(p[i]);
+    h *= 0x100000001b3ULL;
+  }
+  return h;
+}
+
+bool gp25QpDebugEnabled()
+{
+  static const bool enabled = [] {
+    const char* home = std::getenv("HOME");
+    return std::ifstream(std::string(home != nullptr ? home : "") + "/.config/gp25_trajopt_debug.on").good();
+  }();
+  return enabled;
+}
 }
 
 namespace trajopt_sqp
@@ -109,6 +142,107 @@ bool OSQPEigenSolver::solve()
       solver_->setWarmStart(x0_, y0_);
   }
 
+  // [fable qplog 2026-07-13] GP25 debug: dump digests of the exact OSQP-side problem data + rho/warm-start
+  // settings for the first 3 QP solves of the process, and (below, after solveProblem) the primal solution.
+  // Gated + read-only — no behavior change. gp25_qplog_idx stays -1 when the gate is off.
+  int gp25_qplog_idx = -1;
+  if (gp25QpDebugEnabled())
+  {
+    static std::atomic<int> s_qp_counter{ 0 };
+    gp25_qplog_idx = s_qp_counter.fetch_add(1);
+    if (gp25_qplog_idx < 3)
+    {
+      const std::string path = "/tmp/fable_qplog_" + std::to_string(getpid()) + ".txt";
+      if (std::FILE* f = std::fopen(path.c_str(), "a"))
+      {
+        const OsqpEigen::OSQPData* d = solver_->data()->getData();
+        const OSQPSettings* s = solver_->settings()->getSettings();
+
+        // P and A: raw bytes of the OSQP CSC arrays held in OsqpEigen's Data object (x OSQPFloat[nnz],
+        // i OSQPInt[nnz], p OSQPInt[ncols+1]; nnz = p[ncols]). These are what setHessianMatrix /
+        // setLinearConstraintsMatrix stored, i.e. exact for QP#0 (full init path incl. the 2x Hessian
+        // scaling); on later QPs they can lag behind in-place update* calls into the OSQP workspace.
+        long long p_nnz = -1, a_nnz = -1;
+        std::uint64_t p_x = 0, p_i = 0, p_p = 0, a_x = 0, a_i = 0, a_p = 0;
+        if (d != nullptr && d->P != nullptr && d->P->p != nullptr)
+        {
+          p_nnz = static_cast<long long>(d->P->p[d->P->n]);
+          p_x = gp25Fnv1a(d->P->x, sizeof(OSQPFloat) * static_cast<std::size_t>(p_nnz));
+          p_i = gp25Fnv1a(d->P->i, sizeof(OSQPInt) * static_cast<std::size_t>(p_nnz));
+          p_p = gp25Fnv1a(d->P->p, sizeof(OSQPInt) * static_cast<std::size_t>(d->P->n + 1));
+        }
+        if (d != nullptr && d->A != nullptr && d->A->p != nullptr)
+        {
+          a_nnz = static_cast<long long>(d->A->p[d->A->n]);
+          a_x = gp25Fnv1a(d->A->x, sizeof(OSQPFloat) * static_cast<std::size_t>(a_nnz));
+          a_i = gp25Fnv1a(d->A->i, sizeof(OSQPInt) * static_cast<std::size_t>(a_nnz));
+          a_p = gp25Fnv1a(d->A->p, sizeof(OSQPInt) * static_cast<std::size_t>(d->A->n + 1));
+        }
+
+        std::fprintf(f, "QPSOLVE#%d dims n=%lld m=%lld P_nnz=%lld A_nnz=%lld\n",
+                     gp25_qplog_idx,
+                     static_cast<long long>(num_vars_),
+                     static_cast<long long>(num_cnts_),
+                     p_nnz,
+                     a_nnz);
+        std::fprintf(f, "QPSOLVE#%d P src=osqp-data fmt=csc x=%016llx i=%016llx p=%016llx\n",
+                     gp25_qplog_idx,
+                     static_cast<unsigned long long>(p_x),
+                     static_cast<unsigned long long>(p_i),
+                     static_cast<unsigned long long>(p_p));
+        std::fprintf(f, "QPSOLVE#%d A src=osqp-data fmt=csc x=%016llx i=%016llx p=%016llx\n",
+                     gp25_qplog_idx,
+                     static_cast<unsigned long long>(a_x),
+                     static_cast<unsigned long long>(a_i),
+                     static_cast<unsigned long long>(a_p));
+        // q/l/u: raw double bytes of this wrapper's own members — always current (reassigned on every
+        // updateGradient/updateBounds call, incl. the 1e-7 gradient zero-threshold and OSQP_INFTY clamps).
+        std::fprintf(f, "QPSOLVE#%d q src=member hash=%016llx n=%lld\n", gp25_qplog_idx,
+                     static_cast<unsigned long long>(
+                         gp25Fnv1a(gradient_.data(), sizeof(double) * static_cast<std::size_t>(gradient_.size()))),
+                     static_cast<long long>(gradient_.size()));
+        std::fprintf(f, "QPSOLVE#%d l src=member hash=%016llx m=%lld\n", gp25_qplog_idx,
+                     static_cast<unsigned long long>(gp25Fnv1a(
+                         bounds_lower_.data(), sizeof(double) * static_cast<std::size_t>(bounds_lower_.size()))),
+                     static_cast<long long>(bounds_lower_.size()));
+        std::fprintf(f, "QPSOLVE#%d u src=member hash=%016llx m=%lld\n", gp25_qplog_idx,
+                     static_cast<unsigned long long>(gp25Fnv1a(
+                         bounds_upper_.data(), sizeof(double) * static_cast<std::size_t>(bounds_upper_.size()))),
+                     static_cast<long long>(bounds_upper_.size()));
+        // Warm-start vectors as applied at initSolver time (raw double bytes).
+        std::fprintf(f, "QPSOLVE#%d warmstart x0=%016llx y0=%016llx warm_starting=%lld\n", gp25_qplog_idx,
+                     static_cast<unsigned long long>(
+                         gp25Fnv1a(x0_.data(), sizeof(double) * static_cast<std::size_t>(x0_.size()))),
+                     static_cast<unsigned long long>(
+                         gp25Fnv1a(y0_.data(), sizeof(double) * static_cast<std::size_t>(y0_.size()))),
+                     s != nullptr ? static_cast<long long>(s->warm_starting) : -1LL);
+        if (s != nullptr)
+          std::fprintf(f,
+                       "QPSOLVE#%d settings rho=%.17g rho_is_vec=%lld sigma=%.17g alpha=%.17g adaptive_rho=%lld "
+                       "adaptive_rho_interval=%lld adaptive_rho_fraction=%.17g adaptive_rho_tolerance=%.17g "
+                       "scaling=%lld polishing=%lld max_iter=%lld eps_abs=%.17g eps_rel=%.17g "
+                       "check_termination=%lld time_limit=%.17g\n",
+                       gp25_qplog_idx,
+                       static_cast<double>(s->rho),
+                       static_cast<long long>(s->rho_is_vec),
+                       static_cast<double>(s->sigma),
+                       static_cast<double>(s->alpha),
+                       static_cast<long long>(s->adaptive_rho),
+                       static_cast<long long>(s->adaptive_rho_interval),
+                       static_cast<double>(s->adaptive_rho_fraction),
+                       static_cast<double>(s->adaptive_rho_tolerance),
+                       static_cast<long long>(s->scaling),
+                       static_cast<long long>(s->polishing),
+                       static_cast<long long>(s->max_iter),
+                       static_cast<double>(s->eps_abs),
+                       static_cast<double>(s->eps_rel),
+                       static_cast<long long>(s->check_termination),
+                       static_cast<double>(s->time_limit));
+        std::fclose(f);
+      }
+    }
+  }
+
   const Eigen::IOFormat format(8);
   if (OSQP_COMPARE_DEBUG_MODE)
   {
@@ -161,6 +295,54 @@ bool OSQPEigenSolver::solve()
   const auto status = solver_->getStatus();
   if (OSQP_COMPARE_DEBUG_MODE)
     std::cout << "OSQP Status Value: " << static_cast<int>(solver_->getStatus()) << '\n';
+
+  // [fable qplog 2026-07-13] GP25 debug: post-solve half of the gated dump (same counter as above).
+  // Logs the solver-run info (iterations, rho adaptations, timings) and a digest of the primal solution.
+  if (gp25_qplog_idx >= 0 && gp25_qplog_idx < 3)
+  {
+    const std::string path = "/tmp/fable_qplog_" + std::to_string(getpid()) + ".txt";
+    if (std::FILE* f = std::fopen(path.c_str(), "a"))
+    {
+      const OSQPSolver* os = solver_->solver().get();
+      const OSQPInfo* info = (os != nullptr) ? os->info : nullptr;
+      if (info != nullptr)
+        std::fprintf(f,
+                     "QPSOLVE#%d info status_val=%lld status_polish=%lld iter=%lld rho_updates=%lld "
+                     "rho_estimate=%.17g setup_time=%.17g solve_time=%.17g update_time=%.17g polish_time=%.17g "
+                     "obj_val=%.17g prim_res=%.17g dual_res=%.17g\n",
+                     gp25_qplog_idx,
+                     static_cast<long long>(info->status_val),
+                     static_cast<long long>(info->status_polish),
+                     static_cast<long long>(info->iter),
+                     static_cast<long long>(info->rho_updates),
+                     static_cast<double>(info->rho_estimate),
+                     static_cast<double>(info->setup_time),
+                     static_cast<double>(info->solve_time),
+                     static_cast<double>(info->update_time),
+                     static_cast<double>(info->polish_time),
+                     static_cast<double>(info->obj_val),
+                     static_cast<double>(info->prim_res),
+                     static_cast<double>(info->dual_res));
+      // Same success condition as the return path below (read-only re-check, no behavior change).
+      if ((solveExitFlag == OsqpEigen::ErrorExitFlag::NoError) &&
+          ((status == OsqpEigen::Status::Solved) || (status == OsqpEigen::Status::SolvedInaccurate)))
+      {
+        const Eigen::VectorXd gp25_sol = solver_->getSolution();
+        std::fprintf(f, "QPSOLVE#%d x hash=%016llx n=%lld exitflag=%d status=%d\n", gp25_qplog_idx,
+                     static_cast<unsigned long long>(
+                         gp25Fnv1a(gp25_sol.data(), sizeof(double) * static_cast<std::size_t>(gp25_sol.size()))),
+                     static_cast<long long>(gp25_sol.size()),
+                     static_cast<int>(solveExitFlag),
+                     static_cast<int>(status));
+      }
+      else
+      {
+        std::fprintf(f, "QPSOLVE#%d x NOT-SOLVED exitflag=%d status=%d\n", gp25_qplog_idx,
+                     static_cast<int>(solveExitFlag), static_cast<int>(status));
+      }
+      std::fclose(f);
+    }
+  }
 
   if ((solveExitFlag == OsqpEigen::ErrorExitFlag::NoError) &&
       ((status == OsqpEigen::Status::Solved) || (status == OsqpEigen::Status::SolvedInaccurate)))

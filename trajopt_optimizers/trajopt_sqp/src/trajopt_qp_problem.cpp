@@ -9,6 +9,14 @@
 #include <utility>
 #include <iostream>
 
+// [fable qplog 2026-07-13] GP25 debug includes (branch fable-constraint-spike, step A2 term-set dump).
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#include <unistd.h>
+
 /**
  * In the previous version of trajopt it handled hinge cost and absolute costs differently.
  *
@@ -57,6 +65,22 @@
  *  * @example By introducing the slack variable y >= 0, the inequality Ax <= b can be converted
  * to the equation Ax + y = b.
  */
+
+// [fable qplog 2026-07-13] GP25 debug helper (branch fable-constraint-spike, step A2 term-set dump).
+// File-local (internal linkage), used only inside function bodies — ABI-safe. Same gate + output file
+// as the CONVEXIFY# hook in trust_region_sqp_solver.cpp: presence of ~/.config/gp25_trajopt_debug.on,
+// evaluated exactly once per process; zero behavior change when off.
+namespace
+{
+bool gp25QpDebugEnabled()
+{
+  static const bool enabled = [] {
+    const char* home = std::getenv("HOME");
+    return std::ifstream(std::string(home != nullptr ? home : "") + "/.config/gp25_trajopt_debug.on").good();
+  }();
+  return enabled;
+}
+}  // namespace
 
 namespace trajopt_sqp
 {
@@ -721,6 +745,36 @@ void TrajOptQPProblem::Implementation::convexify()
 
   // Update if dynamic constraints are present
   update();
+
+  // [fable qplog 2026-07-13] GP25 debug: enumerate the NLP term sets exactly once per process, on the
+  // first convexify (matches CONVEXIFY#0 in trust_region_sqp_solver.cpp — this runs inside
+  // qp_problem->convexify(), so the TERM lines precede the CONVEXIFY#0 digests in the same file).
+  // One line per set. kind=cost → added via addCostSet (bucket=objective: squared, objective-only, no
+  // rows/slacks; bucket=hinge/abs: costified constraints that DO add QP rows + slack vars).
+  // kind=cnt → added via addConstraintSet (bucket=merit, add QP rows + slack vars).
+  // Gated + read-only — no behavior change.
+  if (gp25QpDebugEnabled())
+  {
+    static std::atomic<bool> s_terms_dumped{ false };
+    if (!s_terms_dumped.exchange(true))
+    {
+      const std::string path = "/tmp/fable_qplog_" + std::to_string(getpid()) + ".txt";
+      if (std::FILE* f = std::fopen(path.c_str(), "a"))
+      {
+        const std::size_t n_hinge = hinge_costs.size() + dyn_hinge_costs.size();
+        for (const auto& term : objective_terms)
+          std::fprintf(f, "TERM kind=cost name=%s rows=%lld bucket=objective\n", term->getName().c_str(),
+                       static_cast<long long>(term->getRows()));
+        for (std::size_t i = 0; i < penalty_constraints.size(); ++i)
+          std::fprintf(f, "TERM kind=cost name=%s rows=%lld bucket=%s\n", penalty_constraints[i]->getName().c_str(),
+                       static_cast<long long>(penalty_constraints[i]->getRows()), (i < n_hinge) ? "hinge" : "abs");
+        for (const auto& term : merit_constraints)
+          std::fprintf(f, "TERM kind=cnt name=%s rows=%lld bucket=merit\n", term->getName().c_str(),
+                       static_cast<long long>(term->getRows()));
+        std::fclose(f);
+      }
+    }
+  }
 
   // Get current variable values
   const Eigen::VectorXd x_initial = variables->getValues();
